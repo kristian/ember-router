@@ -35,8 +35,9 @@ ember-router reset -p <path> --yes [options]
 - `--timeout <ms>` for scan and network callbacks (default `45000`).
 - `-v, --verbose` for more diagnostics on stderr. Repeat for debug output during `run`.
 - `--write-timeout <ms>` for `run`, `write`, and `read` to set the APS delivery timeout (default `15000`).
-- `--read-timeout <ms>` for `read` to set the ZCL reply timeout (default `5000`, range `100`–`300000`).
-- `--expect <commandId>` for `read` to select the ZCL reply command by decimal or `0x` value.
+- `--read-timeout <ms>` for `read` and `run --socket` to set the ZCL reply timeout (default `5000`, range `100`–`300000`).
+- `--expect <commandId>` for `read` and `run --socket` to select the ZCL reply command by decimal or `0x` value.
+- `--socket <path>` for `run` to accept requests over a local Unix domain socket or a Windows named pipe.
 
 #### Joining networks
 
@@ -119,3 +120,13 @@ The router automatically expects Read Attributes Response (`0x01`) or Write Attr
 ```json
 {"type":"aps","source":4660,"sourceEndpoint":1,"destinationEndpoint":1,"profileId":260,"clusterId":513,"lqi":180,"payload":"180101120000299e07"}
 ```
+
+### Local socket
+
+```sh
+ember-router run -p tcp://192.168.1.42:6638 --socket /path/to/private/ember-router.sock
+```
+
+Send one packet per JSON line and receive one reply per line in the same order. A failed request returns `null` and logs the error on stderr. Keep the connection open until replies arrive. The socket supports 16 clients and 8192 bytes per line, with one request active on the adapter at a time.
+
+Use a private directory for the Unix socket. If a crash leaves a stale socket, confirm it is unused before removing it. On Windows, use a named pipe such as `\\.\pipe\ember-router`.

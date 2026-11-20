@@ -3,6 +3,7 @@ import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import { Command, InvalidArgumentError, Option } from 'commander';
 import packageJson from './package.json' with { type: 'json' };
+import { openRequestSocket } from './request-socket.js';
 import { attachNetwork, capture, openRouter, resetRouter, sendPacket, SLStatus, Zcl } from './router.js';
 
 function integer(min, max) {
@@ -43,7 +44,21 @@ function parsePacket(line) {
     return packet;
 }
 
-async function readWrites(ezsp, timeout, signal) {
+function createSender(ezsp, timeout, signal) {
+    let tag = 0;
+    let pending = Promise.resolve();
+    return (packet, expect, requestSignal = signal) => {
+        const operation = pending.then(() => {
+            requestSignal.throwIfAborted();
+            tag = (tag + 1) & 0x7f;
+            return sendPacket(ezsp, packet, tag, timeout, requestSignal, expect);
+        });
+        pending = operation.catch(() => {});
+        return operation;
+    };
+}
+
+async function readWrites(send, signal) {
     const { stdin } = process;
     if (stdin.readableEnded || stdin.destroyed) {
         return;
@@ -66,7 +81,7 @@ async function readWrites(ezsp, timeout, signal) {
             }
 
             try {
-                await sendPacket(ezsp, parsePacket(line), lineNumber & 0x7f, timeout, signal);
+                await send(parsePacket(line));
             } catch (error) {
                 if (signal.aborted) {
                     break;
@@ -126,6 +141,7 @@ async function run(options, mode, packet) {
     process.on('SIGTERM', interrupt);
     process.stdout.on('error', brokenPipe);
     let session;
+    let closeSocket;
     try {
         session = await openRouter(options, log);
         signal.throwIfAborted();
@@ -162,12 +178,26 @@ async function run(options, mode, packet) {
         }
 
         signal.throwIfAborted();
+        const expect = { commandId: options.expect, timeout: options.readTimeout };
         if (mode === 'read') {
-            const expect = { commandId: options.expect, timeout: options.readTimeout };
             return await sendPacket(ezsp, packet, 1, options.writeTimeout, signal, expect);
         }
 
-        await readWrites(ezsp, options.writeTimeout, signal);
+        const send = createSender(ezsp, options.writeTimeout, signal);
+        if (options.socket !== undefined) {
+            const read = async (line, requestSignal) => {
+                try {
+                    return await send(parsePacket(line), expect, requestSignal);
+                } catch (error) {
+                    if (!requestSignal.aborted) {
+                        writeLog('error', `Socket request: ${error.message}`);
+                    }
+                    return null;
+                }
+            };
+            closeSocket = await openRequestSocket(options.socket, read, signal, error => stop.abort(error));
+        }
+        await readWrites(send, signal);
         if (!options.exitAfterWrite && !signal.aborted) {
             await once(signal, 'abort');
         }
@@ -178,7 +208,11 @@ async function run(options, mode, packet) {
         }
     } finally {
         try {
-            await session?.close();
+            try {
+                await closeSocket?.();
+            } finally {
+                await session?.close();
+            }
         } finally {
             process.off('SIGINT', interrupt);
             process.off('SIGTERM', interrupt);
@@ -218,8 +252,9 @@ function readOptions(command) {
         .option('--expect <commandId>', 'Expected ZCL reply command ID (inferred for attribute reads and writes)', integer(0, 255));
 }
 
-packetOptions(program.command('run', { isDefault: true }))
+readOptions(program.command('run', { isDefault: true }))
     .description('Resume, stream received packets, and accept writes on stdin')
+    .option('--socket <path>', 'Listen for requests on a local IPC socket')
     .action((_options, command) => {
         const options = command.optsWithGlobals();
         return run(options, 'run');
