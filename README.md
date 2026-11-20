@@ -33,11 +33,18 @@ ember-router reset -p <path> --yes [options]
 - `-r, --rtscts` to enable hardware flow control.
 - `-m, --manufacturer-code <code>` for the ZCL enum name, decimal value, or `0x` value (default `SILICON_LABORATORIES`). Pass the override again on resume when needed.
 - `--timeout <ms>` for scan and network callbacks (default `45000`).
-- `-v, --verbose` for more diagnostics on stderr. Repeat for debug output during `run`.
-- `--write-timeout <ms>` for `run`, `write`, and `read` to set the APS delivery timeout (default `15000`).
 - `--read-timeout <ms>` for `read` and `run --socket` to set the ZCL reply timeout (default `5000`, range `100`–`300000`).
+- `--write-timeout <ms>` for `run`, `write`, and `read` to set the APS delivery timeout (default `15000`).
 - `--expect <commandId>` for `read` and `run --socket` to select the ZCL reply command by decimal or `0x` value.
 - `--socket <path>` for `run` to accept requests over a local Unix domain socket or a Windows named pipe.
+- `-g, --graceful` for `run` and `write` to attempt one reconnect after adapter loss. Repeat as `-gg` to keep retrying.
+- `-v, --verbose` for more diagnostics on stderr. Repeat for debug output during `run`.
+
+#### Graceful reconnect
+
+After a session starts, `-g` waits 5 seconds and makes one recovery attempt per adapter loss. `-gg` continues with exponential backoff capped at 120 seconds. Recovery resumes the network saved on the adapter. Initial startup failures still exit with an error.
+
+Stdin, stdout, stderr, and local socket clients stay open during recovery. Interrupted requests and requests submitted while offline fail. Socket requests return `null` and writes report errors on stderr. Once the adapter reconnects, the router can handle new requests. `write` still exits after EOF and reports any failed packets in its exit status.
 
 #### Joining networks
 

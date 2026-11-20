@@ -22,6 +22,7 @@ const {
     EmberNodeType,
     EmberOutgoingMessageType,
     EzspNetworkScanType,
+    EzspStatus,
     SLStatus,
 } = requireEmber('zigbee-herdsman/dist/adapter/ember/enums.js');
 const { AdapterTransport } = requireEmber('zigbee-herdsman/dist/adapter/transport.js');
@@ -40,7 +41,7 @@ function check(status, operation, code) {
     }
 }
 
-export async function openRouter(options, log) {
+export async function openRouter(options, log, onDisconnect, signal) {
     setLogger(Object.fromEntries(['debug', 'info', 'warning', 'error'].map(level => [
         level,
         (message, namespace) => log(level, message, namespace),
@@ -53,15 +54,61 @@ export async function openRouter(options, log) {
         xon: !options.rtscts,
         xoff: !options.rtscts,
     });
-    const ezsp = await emberStart(transport);
+    let ezsp;
+    let disconnected;
+    let closing;
+    const adapterLost = message => {
+        if (!disconnected) {
+            disconnected = routerError(message, 'ADAPTER_DISCONNECTED');
+            onDisconnect?.(disconnected);
+        }
+    };
+    const onClose = error => adapterLost(error instanceof Error
+        ? `Adapter transport closed: ${error.message}`
+        : 'Adapter transport closed.');
+    const onReset = status => adapterLost(`Adapter needs a reset: ${EzspStatus[status] ?? status}.`);
 
+    const close = () => closing ??= (async () => {
+        transport.off('close', onClose);
+        ezsp?.off('ncpNeedsResetAndInit', onReset);
+        if (!ezsp) {
+            await transport.close();
+            return;
+        }
+        try {
+            await emberStop(ezsp);
+        } catch (error) {
+            await transport.close().catch(closeError =>
+                log('warning', `Failed to close adapter transport: ${closeError.message}`));
+            throw error;
+        }
+    })();
+
+    const abortConnect = () => {
+        const socket = transport.socketInstance;
+        if (socket?.connecting) {
+            socket.destroy(signal.reason);
+        }
+    };
+    transport.once('close', onClose);
+    signal?.addEventListener('abort', abortConnect, { once: true });
     try {
+        signal?.throwIfAborted();
+        ezsp = await emberStart(transport);
+        signal?.throwIfAborted();
+        ezsp.once('ncpNeedsResetAndInit', onReset);
         await emberNetworkConfig(ezsp, DEFAULT_STACK_CONFIG, options.manufacturerCode);
         await emberRegisterFixedEndpoints(ezsp, [], true);
-        return { ezsp, close: () => emberStop(ezsp) };
+        signal?.throwIfAborted();
+        if (disconnected || !transport.isOpen) {
+            throw disconnected ?? routerError('Adapter connection closed during initialization.', 'ADAPTER_DISCONNECTED');
+        }
+        return { ezsp, close };
     } catch (error) {
-        await emberStop(ezsp);
+        await close().catch(closeError => log('warning', `Failed to stop adapter: ${closeError.message}`));
         throw error;
+    } finally {
+        signal?.removeEventListener('abort', abortConnect);
     }
 }
 
@@ -274,7 +321,7 @@ export async function attachNetwork(ezsp, options, join, signal) {
             throw new Error('The adapter already has a saved network. Run without join to resume it.');
         }
     } else if (!join) {
-        throw new Error('No saved network. Run ember-router join first.');
+        throw routerError('No saved network. Run ember-router join first.', 'NO_SAVED_NETWORK');
     }
 
     const stop = new AbortController();
@@ -311,7 +358,7 @@ async function verifyNetwork(ezsp, selected) {
     const [parameterStatus, role, network] = await ezsp.ezspGetNetworkParameters();
     check(parameterStatus, 'Read network parameters');
     if (role !== EmberNodeType.ROUTER) {
-        throw new Error('Saved network is not configured for a router.');
+        throw routerError('Saved network is not configured for a router.', 'WRONG_NODE_TYPE');
     }
     if (selected && (
         network.panId !== selected.panId ||

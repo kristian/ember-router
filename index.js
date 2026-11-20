@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { once } from 'node:events';
+import { addAbortListener, once } from 'node:events';
 import { createInterface } from 'node:readline';
+import { setTimeout as delay } from 'node:timers/promises';
 import { Command, InvalidArgumentError, Option } from 'commander';
 import packageJson from './package.json' with { type: 'json' };
 import { openRequestSocket } from './request-socket.js';
@@ -47,14 +48,19 @@ function parsePacket(line) {
 function createSender(ezsp, timeout, signal) {
     let tag = 0;
     let pending = Promise.resolve();
-    return (packet, expect, requestSignal = signal) => {
+    return (packet, expect, clientSignal) => {
+        const requestSignal = clientSignal ? AbortSignal.any([signal, clientSignal]) : signal;
         const operation = pending.then(() => {
             requestSignal.throwIfAborted();
             tag = (tag + 1) & 0x7f;
             return sendPacket(ezsp, packet, tag, timeout, requestSignal, expect);
         });
         pending = operation.catch(() => {});
-        return operation;
+        // Release the caller on abort while the adapter queue drains.
+        return new Promise((resolve, reject) => {
+            const abort = addAbortListener(requestSignal, () => reject(requestSignal.reason));
+            operation.then(resolve, reject).finally(() => abort[Symbol.dispose]());
+        });
     };
 }
 
@@ -119,8 +125,33 @@ async function readOnce(options) {
     process.stdout.write(`${JSON.stringify(reply)}\n`);
 }
 
+async function closeSession(session) {
+    try {
+        await session.close();
+    } catch (error) {
+        writeLog('warning', `Could not close adapter: ${error.message}`);
+    }
+}
+
+async function reconnect(connect, graceful, signal) {
+    for (let backoff = 5000; ; backoff = Math.min(backoff * 2, 120_000)) {
+        writeLog('info', `Reconnecting to adapter in ${backoff / 1000} seconds.`);
+        await delay(backoff, undefined, { signal });
+        try {
+            return await connect();
+        } catch (error) {
+            signal.throwIfAborted();
+            if (graceful < 2 || ['NO_SAVED_NETWORK', 'WRONG_NODE_TYPE', 'NETWORK_CHANGED'].includes(error.code)) {
+                throw error;
+            }
+            writeLog('warning', `Could not reconnect to adapter: ${error.message}`);
+        }
+    }
+}
+
 async function run(options, mode, packet) {
     const join = mode === 'join';
+    const streaming = mode === 'run' || mode === 'write';
     const stop = new AbortController();
     const { signal } = stop;
     const interrupt = () => stop.abort();
@@ -137,53 +168,108 @@ async function run(options, mode, packet) {
             writeLog(level, message, namespace);
         }
     };
+
+    let networkId;
+    const connect = async () => {
+        const disconnected = new AbortController();
+        const sessionSignal = AbortSignal.any([signal, disconnected.signal]);
+        const adapter = await openRouter(options, log, error => disconnected.abort(error), sessionSignal);
+        const { ezsp } = adapter;
+        let captureReady = !networkId;
+        try {
+            sessionSignal.throwIfAborted();
+            if (mode !== 'reset') {
+                ezsp.on('stackStatus', status => {
+                    if (status === SLStatus.NETWORK_DOWN) {
+                        disconnected.abort(new Error('Network went down.'));
+                    }
+                });
+                if (streaming) {
+                    capture(ezsp, record => {
+                        if (!captureReady || sessionSignal.aborted) {
+                            return;
+                        }
+                        process.stdout.write(`${JSON.stringify(record)}\n`);
+                        if (process.stdout.writableLength > 1024 * 1024) {
+                            stop.abort(new Error('JSON output consumer is too slow.'));
+                        }
+                    });
+                }
+
+                const network = await attachNetwork(ezsp, options, join, sessionSignal);
+                sessionSignal.throwIfAborted();
+                if (options.graceful) {
+                    const id = Buffer.from(network.extendedPanId);
+                    if (networkId && !networkId.equals(id)) {
+                        throw Object.assign(new Error('Adapter resumed a different Zigbee network.'), { code: 'NETWORK_CHANGED' });
+                    }
+                    networkId = id;
+                }
+                captureReady = true;
+                writeLog('info', `${join ? 'Joined' : 'Resumed'} PAN 0x${network.panId.toString(16)} on channel ${network.radioChannel}.`);
+            }
+            return {
+                ...adapter,
+                signal: sessionSignal,
+                send: streaming ? createSender(ezsp, options.writeTimeout, sessionSignal) : undefined,
+            };
+        } catch (error) {
+            await closeSession(adapter);
+            throw error;
+        }
+    };
+
+    let session;
+    let closeSocket;
+    let monitor;
+    const watchSession = async () => {
+        for (;;) {
+            if (!session.signal.aborted) {
+                await once(session.signal, 'abort');
+            }
+            signal.throwIfAborted();
+            const error = session.signal.reason;
+            if (!options.graceful || error.code !== 'ADAPTER_DISCONNECTED') {
+                throw error;
+            }
+
+            const previous = session;
+            session = undefined;
+            writeLog('warning', error.message);
+            await closeSession(previous);
+            signal.throwIfAborted();
+            session = await reconnect(connect, options.graceful, signal);
+        }
+    };
+
     process.on('SIGINT', interrupt);
     process.on('SIGTERM', interrupt);
     process.stdout.on('error', brokenPipe);
-    let session;
-    let closeSocket;
     try {
-        session = await openRouter(options, log);
-        signal.throwIfAborted();
-        const { ezsp } = session;
-        ezsp.on('ncpNeedsResetAndInit', () => stop.abort(new Error('Adapter needs a reset. Restart ember-router to resume.')));
+        session = await connect();
+        session.signal.throwIfAborted();
         if (mode === 'reset') {
-            const eui64 = await resetRouter(ezsp, options, signal);
+            const eui64 = await resetRouter(session.ezsp, options, session.signal);
             writeLog('info', 'Reset NVM3 tokens.');
             writeLog('info', `Adapter EUI64: ${eui64}`);
             return;
         }
-
-        ezsp.on('stackStatus', status => {
-            if (status === SLStatus.NETWORK_DOWN && !signal.aborted) {
-                stop.abort(new Error('Network went down.'));
-            }
-        });
-        if (mode === 'run' || mode === 'write') {
-            capture(ezsp, record => {
-                if (signal.aborted) {
-                    return;
-                }
-                process.stdout.write(`${JSON.stringify(record)}\n`);
-                if (process.stdout.writableLength > 1024 * 1024) {
-                    stop.abort(new Error('JSON output consumer is too slow.'));
-                }
-            });
-        }
-
-        const network = await attachNetwork(ezsp, options, join, signal);
-        writeLog('info', `${join ? 'Joined' : 'Resumed'} PAN 0x${network.panId.toString(16)} on channel ${network.radioChannel}.`);
         if (join) {
             return;
         }
 
-        signal.throwIfAborted();
         const expect = { commandId: options.expect, timeout: options.readTimeout };
         if (mode === 'read') {
-            return await sendPacket(ezsp, packet, 1, options.writeTimeout, signal, expect);
+            return await sendPacket(session.ezsp, packet, 1, options.writeTimeout, session.signal, expect);
         }
 
-        const send = createSender(ezsp, options.writeTimeout, signal);
+        monitor = watchSession().catch(error => stop.abort(error));
+        const send = (packet, expect, requestSignal) => {
+            if (!session) {
+                throw new Error('Adapter is reconnecting.');
+            }
+            return session.send(packet, expect, requestSignal);
+        };
         if (options.socket !== undefined) {
             const read = async (line, requestSignal) => {
                 try {
@@ -207,16 +293,18 @@ async function run(options, mode, packet) {
             throw error;
         }
     } finally {
+        stop.abort();
         try {
-            try {
-                await closeSocket?.();
-            } finally {
-                await session?.close();
-            }
+            await closeSocket?.();
         } finally {
-            process.off('SIGINT', interrupt);
-            process.off('SIGTERM', interrupt);
-            process.stdout.off('error', brokenPipe);
+            try {
+                await monitor;
+                await session?.close();
+            } finally {
+                process.off('SIGINT', interrupt);
+                process.off('SIGTERM', interrupt);
+                process.stdout.off('error', brokenPipe);
+            }
         }
     }
 }
@@ -252,7 +340,14 @@ function readOptions(command) {
         .option('--expect <commandId>', 'Expected ZCL reply command ID (inferred for attribute reads and writes)', integer(0, 255));
 }
 
+function gracefulOption() {
+    return new Option('-g, --graceful', 'Reconnect after adapter loss (-g once, -gg repeatedly)')
+        .argParser((_, count) => count + 1)
+        .default(0);
+}
+
 readOptions(program.command('run', { isDefault: true }))
+    .addOption(gracefulOption())
     .description('Resume, stream received packets, and accept writes on stdin')
     .option('--socket <path>', 'Listen for requests on a local IPC socket')
     .action((_options, command) => {
@@ -261,6 +356,7 @@ readOptions(program.command('run', { isDefault: true }))
     });
 
 packetOptions(program.command('write'))
+    .addOption(gracefulOption())
     .description('Resume and send packets from stdin, then exit at EOF')
     .action((_options, command) => {
         const options = command.optsWithGlobals();
