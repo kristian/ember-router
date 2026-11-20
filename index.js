@@ -2,6 +2,7 @@
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import { Command, InvalidArgumentError, Option } from 'commander';
+import packageJson from './package.json' with { type: 'json' };
 import { attachNetwork, capture, openRouter, resetRouter, sendPacket, SLStatus, Zcl } from './router.js';
 
 function integer(min, max) {
@@ -34,6 +35,14 @@ function writeLog(level, message, namespace) {
     process.stderr.write(`${prefix}: ${text}\n`);
 }
 
+function parsePacket(line) {
+    const packet = JSON.parse(line);
+    if (packet === null || typeof packet !== 'object' || Array.isArray(packet)) {
+        throw new Error('Expected a packet object.');
+    }
+    return packet;
+}
+
 async function readWrites(ezsp, timeout, signal) {
     const { stdin } = process;
     if (stdin.readableEnded || stdin.destroyed) {
@@ -57,11 +66,7 @@ async function readWrites(ezsp, timeout, signal) {
             }
 
             try {
-                const packet = JSON.parse(line);
-                if (!packet || typeof packet !== 'object' || Array.isArray(packet)) {
-                    throw new Error('Expected a packet object.');
-                }
-                await sendPacket(ezsp, packet, lineNumber & 0x7f, timeout, signal);
+                await sendPacket(ezsp, parsePacket(line), lineNumber & 0x7f, timeout, signal);
             } catch (error) {
                 if (signal.aborted) {
                     break;
@@ -77,7 +82,29 @@ async function readWrites(ezsp, timeout, signal) {
     }
 }
 
-async function run(options, mode) {
+async function readPacketLine() {
+    const { stdin } = process;
+    const input = createInterface({ input: stdin, crlfDelay: Infinity, terminal: false });
+    try {
+        for await (const line of input) {
+            if (line.trim()) {
+                return line;
+            }
+        }
+        throw new Error('Expected a packet on stdin.');
+    } finally {
+        input.close();
+        stdin.pause();
+    }
+}
+
+async function readOnce(options) {
+    const packet = parsePacket(await readPacketLine());
+    const reply = await run(options, 'read', packet);
+    process.stdout.write(`${JSON.stringify(reply)}\n`);
+}
+
+async function run(options, mode, packet) {
     const join = mode === 'join';
     const stop = new AbortController();
     const { signal } = stop;
@@ -116,7 +143,7 @@ async function run(options, mode) {
                 stop.abort(new Error('Network went down.'));
             }
         });
-        if (!join) {
+        if (mode === 'run' || mode === 'write') {
             capture(ezsp, record => {
                 if (signal.aborted) {
                     return;
@@ -135,13 +162,18 @@ async function run(options, mode) {
         }
 
         signal.throwIfAborted();
+        if (mode === 'read') {
+            const expect = { commandId: options.expect, timeout: options.readTimeout };
+            return await sendPacket(ezsp, packet, 1, options.writeTimeout, signal, expect);
+        }
+
         await readWrites(ezsp, options.writeTimeout, signal);
         if (!options.exitAfterWrite && !signal.aborted) {
             await once(signal, 'abort');
         }
         signal.throwIfAborted();
     } catch (error) {
-        if (error?.name !== 'AbortError' && error?.code !== 'EPIPE') {
+        if (mode === 'read' || (error?.name !== 'AbortError' && error?.code !== 'EPIPE')) {
             throw error;
         }
     } finally {
@@ -155,7 +187,7 @@ async function run(options, mode) {
     }
 }
 
-const program = new Command().name('ember-router')
+const program = new Command().name('ember-router').version(packageJson.version)
     .description('Resume a saved Zigbee router network and stream packets, or join an open network')
     .requiredOption('-p, --path <path>', 'Serial port or tcp://host:port')
     .option('-b, --baud-rate <rate>', 'Serial baud rate', integer(1, 4_000_000), 115200)
@@ -180,6 +212,12 @@ function packetOptions(command) {
         .option('--write-timeout <ms>', 'Wait for each APS delivery status', integer(100, 300_000), 15000);
 }
 
+function readOptions(command) {
+    return packetOptions(command)
+        .option('--read-timeout <ms>', 'Wait for a matching ZCL reply', integer(100, 300_000), 5000)
+        .option('--expect <commandId>', 'Expected ZCL reply command ID (inferred for attribute reads and writes)', integer(0, 255));
+}
+
 packetOptions(program.command('run', { isDefault: true }))
     .description('Resume, stream received packets, and accept writes on stdin')
     .action((_options, command) => {
@@ -193,6 +231,10 @@ packetOptions(program.command('write'))
         const options = command.optsWithGlobals();
         return run({ ...options, exitAfterWrite: true }, 'write');
     });
+
+readOptions(program.command('read'))
+    .description('Send one packet from stdin and print the matching reply')
+    .action((_options, command) => readOnce(command.optsWithGlobals()));
 
 program.command('reset').description('Leave the saved network and reset NVM3 tokens')
     .option('--yes', 'Confirm deletion of saved adapter state')

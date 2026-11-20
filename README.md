@@ -15,11 +15,14 @@ npm install -g ember-router
 ```sh
 ember-router join -p <path> [options]
 ember-router run -p <path> [options]
+ember-router read -p <path> [options]
 ember-router write -p <path> [options]
 ember-router reset -p <path> --yes [options]
 ```
 
 `run` is the default command (and can be omitted). It resumes the saved network, streams received packets to stdout, and accepts outgoing packets on stdin. With empty or closed stdin, it continues receiving.
+
+`read` sends one JSON packet from stdin and prints the matching ZCL reply.
 
 `write` resumes the saved network and sends a single packet or a batch from stdin. It exits after stdin closes and all submitted packets have been processed.
 
@@ -31,7 +34,9 @@ ember-router reset -p <path> --yes [options]
 - `-m, --manufacturer-code <code>` for the ZCL enum name, decimal value, or `0x` value (default `SILICON_LABORATORIES`). Pass the override again on resume when needed.
 - `--timeout <ms>` for scan and network callbacks (default `45000`).
 - `-v, --verbose` for more diagnostics on stderr. Repeat for debug output during `run`.
-- `--write-timeout <ms>` for `run` and `write` to set the delivery timeout per packet (default `15000`).
+- `--write-timeout <ms>` for `run`, `write`, and `read` to set the APS delivery timeout (default `15000`).
+- `--read-timeout <ms>` for `read` to set the ZCL reply timeout (default `5000`, range `100`–`300000`).
+- `--expect <commandId>` for `read` to select the ZCL reply command by decimal or `0x` value.
 
 #### Joining networks
 
@@ -81,7 +86,7 @@ ember-router reset -p tcp://192.168.1.42:6638 --yes
 
 ## Packet format
 
-Stdout contains one JSON object per received packet. Diagnostics go to stderr. The router sees packets delivered to its host by EZSP. Retain the sniffer for passive observation of exchanges between other devices.
+With `run` and `write`, stdout contains one JSON object per received packet. Diagnostics go to stderr. The router sees packets delivered to its host by EZSP. Retain the sniffer for passive observation of exchanges between other devices.
 
 ```json
 {"type":"aps","source":4660,"sourceEndpoint":1,"destinationEndpoint":1,"profileId":260,"clusterId":513,"lqi":180,"payload":"1842011200299e07"}
@@ -89,7 +94,7 @@ Stdout contains one JSON object per received packet. Diagnostics go to stderr. T
 
 `zdo` packets use the same frame fields. `touchlink` packets carry `panId`, `source`, `groupId`, `lqi`, and `payload`.
 
-Send one JSON object per line on stdin. The following example reads an attribute on a known destination using an already encoded ZCL payload:
+Send one JSON object per line on stdin. The following example sends an already encoded ZCL Read Attributes frame. Use `read` to wait for a matching reply.
 
 ```json
 {"destination":4660,"destinationEndpoint":1,"clusterId":513,"payload":"1001001200"}
@@ -97,3 +102,20 @@ Send one JSON object per line on stdin. The following example reads an attribute
 
 For attribute writes, supply the encoded ZCL Write Attributes frame in `payload`. The CLI sends raw APS unicasts and leaves encoding and device identity resolution to the caller. Addresses and IDs are numeric. Endpoints default to `1` and `profileId` to `260`. The CLI waits for each delivery result before proceeding.
 
+## Read format
+
+Read the occupied heating setpoint (`0x0012`) from a thermostat at short address `4660`.
+
+```sh
+ember-router read -p tcp://192.168.1.42:6638 <<'EOF'
+{"destination":4660,"clusterId":513,"payload":"1001001200"}
+EOF
+```
+
+The router automatically expects Read Attributes Response (`0x01`) or Write Attributes Response (`0x04`) for the corresponding request. Use `--expect` to override that choice or match a reply to another ZCL command.
+
+`read` prints the received packet, including matching ZCL Default Responses with an error status. A send failure or timeout reports an error on stderr and exits with status `1`.
+
+```json
+{"type":"aps","source":4660,"sourceEndpoint":1,"destinationEndpoint":1,"profileId":260,"clusterId":513,"lqi":180,"payload":"180101120000299e07"}
+```

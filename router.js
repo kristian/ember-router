@@ -15,6 +15,7 @@ const { Zcl, ZSpec, setLogger } = requireEmber('zigbee-herdsman');
 const {
     EmberApsOption,
     EmberExtendedSecurityBitmask,
+    EmberIncomingMessageType,
     EmberInitialSecurityBitmask,
     EmberJoinMethod,
     EmberKeyStatus,
@@ -29,9 +30,13 @@ const { STACK_PROFILE_ZIGBEE_PRO } = requireEmber('zigbee-herdsman/dist/adapter/
 
 export { SLStatus, Zcl };
 
-function check(status, operation) {
+function routerError(message, code) {
+    return Object.assign(new Error(message), code ? { code } : {});
+}
+
+function check(status, operation, code) {
     if (status !== SLStatus.OK) {
-        throw new Error(`${operation}: ${SLStatus[status] ?? status}`);
+        throw routerError(`${operation}: ${SLStatus[status] ?? status}`, code);
     }
 }
 
@@ -60,7 +65,7 @@ export async function openRouter(options, log) {
     }
 }
 
-function pendingEvent(timeout, signal, subscribe, description = 'adapter callback') {
+function pendingEvent(timeout, signal, subscribe, description = 'adapter callback', timeoutCode) {
     let unsubscribe;
     let timer;
     let abort;
@@ -70,7 +75,7 @@ function pendingEvent(timeout, signal, subscribe, description = 'adapter callbac
         try {
             signal.throwIfAborted();
             unsubscribe = subscribe(resolve, reject);
-            timer = setTimeout(() => reject(new Error(`Timed out waiting for ${description}.`)), timeout);
+            timer = setTimeout(() => reject(routerError(`Timed out waiting for ${description}.`, timeoutCode)), timeout);
         } catch (error) {
             reject(error);
         }
@@ -336,10 +341,43 @@ export async function resetRouter(ezsp, options, signal) {
     return eui64.replace(/^0x/i, '');
 }
 
-export function capture(ezsp, emit) {
-    const original = ezsp.ezspIncomingMessageHandler.bind(ezsp);
-    let dispatching = false;
-    const packet = (frame, source, lqi, payload) => emit({
+const apsObservers = new WeakMap();
+
+function observeAps(ezsp, observe) {
+    let observers = apsObservers.get(ezsp);
+    if (!observers) {
+        observers = new Set();
+        apsObservers.set(ezsp, observers);
+        const original = ezsp.ezspIncomingMessageHandler.bind(ezsp);
+        let dispatching = false;
+        const dispatch = (type, frame, lqi, source, payload) => {
+            for (const listener of observers) {
+                listener(type, frame, lqi, source, payload);
+            }
+        };
+
+        // The driver emits incomingMessage for selected profiles only.
+        ezsp.ezspIncomingMessageHandler = (type, frame, info, payload) => {
+            dispatch(type, frame, info.lastHopLqi, info.senderShortId, payload);
+            dispatching = true;
+            try {
+                original(type, frame, info, payload);
+            } finally {
+                dispatching = false;
+            }
+        };
+        ezsp.on('incomingMessage', (...args) => {
+            if (!dispatching) {
+                dispatch(...args);
+            }
+        });
+    }
+    observers.add(observe);
+    return () => observers.delete(observe);
+}
+
+function apsPacket(frame, source, lqi, payload) {
+    return {
         type: frame.profileId === 0 ? 'zdo' : 'aps',
         source,
         sourceEndpoint: frame.sourceEndpoint,
@@ -348,27 +386,38 @@ export function capture(ezsp, emit) {
         clusterId: frame.clusterId,
         lqi,
         payload: payload.toString('hex'),
-    });
-
-    ezsp.ezspIncomingMessageHandler = (type, frame, info, payload) => {
-        packet(frame, info.senderShortId, info.lastHopLqi, payload);
-        dispatching = true;
-        try {
-            original(type, frame, info, payload);
-        } finally {
-            dispatching = false;
-        }
     };
-    ezsp.on('incomingMessage', (_type, frame, lqi, source, payload) => {
-        if (!dispatching) {
-            packet(frame, source, lqi, payload);
-        }
-    });
+}
+
+export function capture(ezsp, emit) {
+    observeAps(ezsp, (_type, frame, lqi, source, payload) => emit(apsPacket(frame, source, lqi, payload)));
     ezsp.on('touchlinkMessage', (panId, source, groupId, lqi, payload) =>
         emit({ type: 'touchlink', panId, source, groupId, lqi, payload: payload.toString('hex') }));
 }
 
-export async function sendPacket(ezsp, packet, tag, timeout, signal) {
+const attributeReplies = new Map([
+    [Zcl.Foundation.read.ID, Zcl.Foundation.readRsp.ID],
+    [Zcl.Foundation.write.ID, Zcl.Foundation.writeRsp.ID],
+]);
+
+function matchesReply(request, commandId, payload) {
+    const header = Zcl.Header.fromBuffer(payload);
+    if (!header ||
+        header.transactionSequenceNumber !== request.transactionSequenceNumber ||
+        header.manufacturerCode !== request.manufacturerCode ||
+        header.frameControl.direction === request.frameControl.direction) {
+        return false;
+    }
+
+    const defaultResponse = Zcl.Foundation.defaultRsp.ID;
+    if (header.isGlobal && header.commandIdentifier === defaultResponse) {
+        return payload.length >= header.length + 2 && payload[header.length] === request.commandIdentifier &&
+            (commandId === defaultResponse || payload[header.length + 1] !== Zcl.Status.SUCCESS);
+    }
+    return header.frameControl.frameType === request.frameControl.frameType && header.commandIdentifier === commandId;
+}
+
+export async function sendPacket(ezsp, packet, tag, timeout, signal, expect) {
     const { destination, destinationEndpoint = 1, sourceEndpoint = 1, profileId = ZSpec.HA_PROFILE_ID, clusterId, payload } = packet;
     const fields = [
         ['destination', destination, 0, 0xfff7],
@@ -379,14 +428,23 @@ export async function sendPacket(ezsp, packet, tag, timeout, signal) {
     ];
     for (const [label, value, min, max] of fields) {
         if (!Number.isInteger(value) || value < min || value > max) {
-            throw new Error(`Invalid ${label}.`);
+            throw routerError(`Invalid ${label}.`, 'INVALID_PACKET');
         }
     }
     if (typeof payload !== 'string' || !/^(?:[\da-f]{2})+$/i.test(payload)) {
-        throw new Error('payload must be nonempty, even-length hex.');
+        throw routerError('payload must be nonempty, even-length hex.', 'INVALID_PACKET');
     }
 
     const message = Buffer.from(payload, 'hex');
+    const request = expect && Zcl.Header.fromBuffer(message);
+    if (expect && (!request || !(request.isGlobal || request.isSpecific) || request.frameControl.reservedBits !== 0)) {
+        throw routerError('payload must have a valid ZCL header to match a reply.', 'INVALID_PACKET');
+    }
+    const responseCommand = expect?.commandId ?? (request?.isGlobal ? attributeReplies.get(request.commandIdentifier) : undefined);
+    if (expect && responseCommand === undefined) {
+        throw routerError('Use --expect to select a reply for this ZCL command.', 'EXPECT_REQUIRED');
+    }
+
     const aps = {
         profileId,
         clusterId,
@@ -404,13 +462,37 @@ export async function sendPacket(ezsp, packet, tag, timeout, signal) {
         };
         ezsp.on('messageSent', listener);
         return () => ezsp.off('messageSent', listener);
-    });
+    }, 'adapter callback', 'DELIVERY_TIMEOUT');
+    const reply = expect && pendingEvent(expect.timeout, signal, resolve =>
+        observeAps(ezsp, (type, frame, lqi, source, payload) => {
+            if ((type === EmberIncomingMessageType.UNICAST || type === EmberIncomingMessageType.UNICAST_REPLY) &&
+                source === destination && frame.profileId === profileId && frame.clusterId === clusterId &&
+                frame.sourceEndpoint === destinationEndpoint && frame.destinationEndpoint === sourceEndpoint &&
+                matchesReply(request, responseCommand, payload)) {
+                resolve(apsPacket(frame, source, lqi, payload));
+            }
+        }), 'ZCL reply', 'REPLY_TIMEOUT');
     try {
         signal.throwIfAborted();
         const [status] = await ezsp.ezspSendUnicast(EmberOutgoingMessageType.DIRECT, destination, aps, tag, message);
-        check(status, 'Queue write');
-        check(await delivery.promise, 'Deliver write');
+        check(status, 'Queue write', 'QUEUE_FAILED');
+        const delivered = delivery.promise.then(result => check(result, 'Deliver write', 'DELIVERY_FAILED'));
+        if (!reply) {
+            await delivered;
+            return;
+        }
+
+        // A matching device response can arrive before the APS delivery callback, even if its ACK is lost.
+        let deliveryError;
+        delivered.catch(error => { deliveryError = error; });
+        try {
+            return await reply.promise;
+        } catch (error) {
+            signal.throwIfAborted();
+            throw deliveryError ?? error;
+        }
     } finally {
+        reply?.close();
         delivery.close();
     }
 }
