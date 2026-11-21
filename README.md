@@ -18,9 +18,11 @@ ember-router run -p <path> [options]
 ember-router read -p <path> [options]
 ember-router write -p <path> [options]
 ember-router reset -p <path> --yes [options]
+ember-router encode
+ember-router decode
 ```
 
-`run` is the default command (and can be omitted). It resumes the saved network, streams received packets to stdout, and accepts outgoing packets on stdin. With empty or closed stdin, it continues receiving.
+`run` is the default command (and can be omitted). It resumes the saved network, streams received packets to stdout, and reads packets to send from stdin. With empty or closed stdin, it continues receiving.
 
 `read` sends one packet from stdin and writes the matching ZCL reply to stdout.
 
@@ -28,7 +30,7 @@ ember-router reset -p <path> --yes [options]
 
 ### Options
 
-- `-p, --path <path>` for the serial port or TCP address (required).
+- `-p, --path <path>` for the serial port or TCP address (required for adapter commands).
 - `-b, --baud-rate <rate>` for the serial baud rate (default `115200`).
 - `-r, --rtscts` to enable hardware flow control.
 - `-m, --manufacturer-code <code>` for the ZCL enum name, decimal value, or `0x` value (default `SILICON_LABORATORIES`). Pass the override again on resume when needed.
@@ -44,7 +46,7 @@ ember-router reset -p <path> --yes [options]
 
 After a session starts, `-g` waits 5 seconds and makes one recovery attempt per adapter loss. `-gg` continues with exponential backoff capped at 120 seconds. Recovery resumes the network saved on the adapter. Initial startup failures still exit with an error.
 
-Stdin, stdout, stderr, and local socket clients stay open during recovery. Interrupted requests and requests submitted while offline fail. Socket requests return a zero-length record and writes report errors on stderr. Once the adapter reconnects, the router can handle new requests. `write` still exits after EOF and reports any failed packets in its exit status.
+Stdin, stdout, stderr, and local socket clients stay open during recovery. Interrupted requests and requests submitted while offline fail. Socket responses use the `00 00` failure marker and writes report errors on stderr. Once the adapter reconnects, the router can handle new requests. `write` still exits after EOF and reports any failed packets in its exit status.
 
 #### Joining networks
 
@@ -94,27 +96,61 @@ ember-router reset -p tcp://192.168.1.42:6638 --yes
 
 ## Binary packet format
 
-Starting with version 2.0, `read`, `write`, `run`, and `run --socket` use the same length-prefixed binary records. The addressing fields follow [Silicon Labs’ EZSP APS metadata](https://docs.silabs.com/zigbee/7.4/zigbee-stack-api/ember-aps-frame). The length prefix and record kind are specific to Ember Router. Payloads are raw Zigbee bytes. Diagnostics go to stderr.
+Starting with version 2.0, `read`, `write`, `run`, and `run --socket` use the same length-prefixed binary packets. The addressing fields follow [Silicon Labs’ EZSP APS metadata](https://docs.silabs.com/zigbee/7.4/zigbee-stack-api/ember-aps-frame). The length prefix and packet kind are specific to Ember Router. Payloads are raw Zigbee bytes. Diagnostics go to stderr.
 
-Each record starts with a two-byte unsigned little-endian body length. It excludes the length field itself. The first byte of the body is the record kind. All multi-byte values below are little-endian.
+Each binary packet starts with a two-byte unsigned little-endian body length. It excludes the length field itself. The first byte of the body is the packet kind. All multi-byte values below are little-endian.
 
 | Kind | Body fields after the kind byte, in order |
 | --- | --- |
 | `0x00` APS or ZDO | Short address (2), profile ID (2), cluster ID (2), source endpoint (1), destination endpoint (1), LQI (1), raw payload |
 | `0x01` Touchlink | PAN ID (2), source EUI64 (8), group ID (2), LQI (1), raw payload |
 
-Field sizes are in bytes. For APS sends, the short address is the destination and the LQI byte can be zero. The short address and LQI are the sender’s values on receive. Profile `0x0000` identifies a ZDO record. Stdin and socket clients send APS application unicasts. ZDO and Touchlink records are receive-only.
+Field sizes are in bytes. For APS sends, the short address is the destination and the LQI byte can be zero. The short address and LQI are the sender’s values on receive. Profile `0x0000` identifies a ZDO packet. Stdin and socket clients send APS application unicasts. ZDO and Touchlink records are receive-only.
+
+### Encode and decode JSON Lines
+
+`encode` converts JSON Lines requests to binary. It takes `destination`, `clusterId`, and a hex `payload`. Endpoints default to `1` and `profileId` to `260`.
+
+`decode` converts received binary packets to JSON Lines. A socket failure decodes to `null`. Both commands work without an adapter.
+
+```sh
+ember-router decode < capture.bin
+```
+
+### Node.js socket client
+
+`encodePacket(packet)` converts a packet to send into bytes. `decodePacket(bytes)` converts one received packet to a JSON-shaped object. Use `decodePackets(socket)` to decode received packets from a stream.
+
+```js
+import { createConnection } from 'node:net';
+import { decodePackets, encodePacket } from 'ember-router';
+
+const socket = createConnection('/path/to/private/ember-router.sock');
+socket.write(encodePacket({ destination: 4660, clusterId: 513, payload: '1001001200' }));
+for await (const reply of decodePackets(socket)) {
+    console.log(reply);
+    socket.end();
+    break;
+}
+```
 
 ### Read an attribute
 
-Read the occupied heating setpoint (`0x0012`) from short address `0x1234`, endpoint `1`, profile `0x0104`, and cluster `0x0201`. `xxd` converts the example hex to bytes and displays the binary reply.
+Read the occupied heating setpoint (`0x0012`) from short address `0x1234`, endpoint `1`, profile `0x0104`, and cluster `0x0201`.
+
+```sh
+printf '%s\n' '{"destination":4660,"clusterId":513,"payload":"1001001200"}' |
+  ember-router encode | ember-router read -p tcp://192.168.1.42:6638 | ember-router decode
+```
+
+The same request in binary can be sent and inspected with `xxd`.
 
 ```sh
 printf '%s' 0f00003412040101020101001001001200 | xxd -r -p |
   ember-router read -p tcp://192.168.1.42:6638 | xxd -g 1
 ```
 
-The request body is 15 bytes and ends with ZCL payload `10 01 00 12 00`. The router infers Read Attributes Response (`0x01`) or Write Attributes Response (`0x04`) for those requests. Use `--expect` to select a different ZCL reply command. `read` writes one matching record, including a matching ZCL Default Response with an error status. A send failure or timeout reports an error on stderr and exits with status `1`.
+The request body is 15 bytes and ends with ZCL payload `10 01 00 12 00`. The router infers Read Attributes Response (`0x01`) or Write Attributes Response (`0x04`) for those requests. Use `--expect` to select a different ZCL reply command. `read` writes one matching packet, including a matching ZCL Default Response with an error status. A send failure or timeout reports an error on stderr and exits with status `1`.
 
 ### Local socket
 
@@ -122,6 +158,6 @@ The request body is 15 bytes and ends with ZCL payload `10 01 00 12 00`. The rou
 ember-router run -p tcp://192.168.1.42:6638 --socket /path/to/private/ember-router.sock > capture.bin
 ```
 
-Send one record and receive one record in the same order on the same connection. A failed exchange returns `00 00` (a zero-length body) and logs the error on stderr. Keep the connection open until the replies arrive. The socket supports up to 16 clients and one active send on the adapter at a time.
+Send packets and receive their replies in the same order on the same connection. A failed exchange returns `00 00` (a zero-length body) and logs the error on stderr. Keep the connection open until the replies arrive. The socket supports up to 16 clients and one active send on the adapter at a time.
 
 Use a private directory for the Unix socket. If a crash leaves a stale socket, confirm it is unused before removing it. On Windows, use a named pipe such as `\\.\pipe\ember-router`.

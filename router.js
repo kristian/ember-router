@@ -1,6 +1,7 @@
 import './silence-ember-zli.js';
 import { createRequire } from 'node:module';
 import { createInterview } from './interview.js';
+import { validateSendPacket } from './packet-codec.js';
 import {
     emberNetworkConfig,
     emberNetworkInit,
@@ -442,7 +443,7 @@ function apsPacket(frame, source, lqi, payload) {
 export function capture(ezsp, emit) {
     observeAps(ezsp, (_type, frame, lqi, source, payload) => emit(apsPacket(frame, source, lqi, payload)));
     ezsp.on('touchlinkMessage', (panId, source, groupId, lqi, payload) =>
-        emit({ type: 'touchlink', panId, source, groupId, lqi, payload }));
+        emit({ type: 'touchlink', panId, source: BigInt(source), groupId, lqi, payload }));
 }
 
 const attributeReplies = new Map([
@@ -469,18 +470,7 @@ function matchesReply(request, commandId, payload) {
 
 export async function sendPacket(ezsp, packet, tag, timeout, signal, expect) {
     const { destination, destinationEndpoint = 1, sourceEndpoint = 1, profileId = ZSpec.HA_PROFILE_ID, clusterId, payload } = packet;
-    const fields = [
-        ['destination', destination, 0, 0xfff7],
-        ['sourceEndpoint', sourceEndpoint, 1, 254],
-        ['destinationEndpoint', destinationEndpoint, 1, 240],
-        ['clusterId', clusterId, 0, 0xffff],
-        ['profileId', profileId, 1, 0xffff],
-    ];
-    for (const [label, value, min, max] of fields) {
-        if (!Number.isInteger(value) || value < min || value > max) {
-            throw routerError(`Invalid ${label}.`, 'INVALID_PACKET');
-        }
-    }
+    validateSendPacket({ destination, profileId, clusterId, sourceEndpoint, destinationEndpoint });
     // SEND_UNICAST uses three bytes for mode and destination, eleven for the APS frame, and one for payload length.
     const messageTagLength = ezsp.version < 0x0e ? 1 : 2;
     const maxPayloadLength = EZSP_MAX_FRAME_LENGTH - EZSP_EXTENDED_PARAMETERS_INDEX - 3 - 11 - messageTagLength - 1;

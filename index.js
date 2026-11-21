@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 import { addAbortListener, once } from 'node:events';
+import { createInterface } from 'node:readline';
+import { pipeline } from 'node:stream/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Command, InvalidArgumentError, Option } from 'commander';
 import packageJson from './package.json' with { type: 'json' };
-import { decodeOutgoing, encodePacket, readRecords } from './packet-wire.js';
+import { decodePackets, encodePacket } from './packet.js';
+import { decodeSendPacket, encodePacketBytes, readPacketBytes } from './packet-codec.js';
 import { openRequestSocket } from './request-socket.js';
 import { attachNetwork, capture, openRouter, resetRouter, sendPacket, SLStatus, Zcl } from './router.js';
 
@@ -63,22 +66,22 @@ async function readWrites(send, signal) {
     }
 
     const abort = addAbortListener(signal, () => stdin.destroy());
-    let recordNumber = 0;
+    let packetNumber = 0;
     try {
-        for await (const body of readRecords(stdin)) {
+        for await (const bytes of readPacketBytes(stdin)) {
             if (signal.aborted) {
                 break;
             }
 
-            recordNumber++;
+            packetNumber++;
             try {
-                await send(decodeOutgoing(body));
+                await send(decodeSendPacket(bytes));
             } catch (error) {
                 if (signal.aborted) {
                     break;
                 }
                 process.exitCode = 1;
-                writeLog('error', `Write record ${recordNumber}: ${error.message}`);
+                writeLog('error', `Write packet ${packetNumber}: ${error.message}`);
             }
         }
     } catch (error) {
@@ -93,8 +96,8 @@ async function readWrites(send, signal) {
 async function readPacket() {
     const { stdin } = process;
     try {
-        for await (const body of readRecords(stdin)) {
-            return decodeOutgoing(body);
+        for await (const bytes of readPacketBytes(stdin)) {
+            return decodeSendPacket(bytes);
         }
         throw new Error('Expected a packet on stdin.');
     } finally {
@@ -105,7 +108,43 @@ async function readPacket() {
 async function readOnce(options) {
     const packet = await readPacket();
     const reply = await run(options, 'read', packet);
-    process.stdout.write(encodePacket(reply));
+    process.stdout.write(encodePacketBytes(reply));
+}
+
+async function* encodePackets(input) {
+    const lines = createInterface({ input, crlfDelay: Infinity, terminal: false });
+    let lineNumber = 0;
+    try {
+        for await (const line of lines) {
+            lineNumber++;
+            if (!line.trim()) {
+                continue;
+            }
+            try {
+                yield encodePacket(JSON.parse(line));
+            } catch (error) {
+                throw new Error(`Encode line ${lineNumber}: ${error.message}`);
+            }
+        }
+    } finally {
+        lines.close();
+    }
+}
+
+async function* decodeJsonLines(input) {
+    for await (const packet of decodePackets(input)) {
+        yield `${JSON.stringify(packet)}\n`;
+    }
+}
+
+async function convertPackets(packets) {
+    try {
+        await pipeline(process.stdin, packets, process.stdout);
+    } catch (error) {
+        if (error.code !== 'EPIPE') {
+            throw error;
+        }
+    }
 }
 
 async function closeSession(session) {
@@ -168,11 +207,11 @@ async function run(options, mode, packet) {
                     }
                 });
                 if (streaming) {
-                    capture(ezsp, record => {
+                    capture(ezsp, packet => {
                         if (!captureReady || sessionSignal.aborted) {
                             return;
                         }
-                        process.stdout.write(encodePacket(record));
+                        process.stdout.write(encodePacketBytes(packet));
                         if (process.stdout.writableLength > 1024 * 1024) {
                             stop.abort(new Error('Packet output consumer is too slow.'));
                         }
@@ -254,9 +293,9 @@ async function run(options, mode, packet) {
             return session.send(packet, expect, requestSignal);
         };
         if (options.socket !== undefined) {
-            const read = async (body, requestSignal) => {
+            const read = async (bytes, requestSignal) => {
                 try {
-                    return await send(decodeOutgoing(body), expect, requestSignal);
+                    return await send(decodeSendPacket(bytes), expect, requestSignal);
                 } catch (error) {
                     if (!requestSignal.aborted) {
                         writeLog('error', `Socket request: ${error.message}`);
@@ -293,13 +332,19 @@ async function run(options, mode, packet) {
 }
 
 const program = new Command().name('ember-router').version(packageJson.version)
-    .description('Resume a saved Zigbee router network and stream packets, or join an open network')
-    .requiredOption('-p, --path <path>', 'Serial port or tcp://host:port')
+    .description('Run a Zigbee router, join a network, or convert packet formats')
+    .option('-p, --path <path>', 'Serial port or tcp://host:port (required for adapter commands)')
     .option('-b, --baud-rate <rate>', 'Serial baud rate', integer(1, 4_000_000), 115200)
     .option('-r, --rtscts', 'Use RTS/CTS flow control', false)
     .option('-m, --manufacturer-code <code>', 'ZCL manufacturer enum name, decimal or hex', manufacturer, Zcl.ManufacturerCode.SILICON_LABORATORIES)
     .option('--timeout <ms>', 'Network and scan callback timeout', integer(100, 300_000), 45000)
     .option('-v, --verbose', 'Increase diagnostic verbosity', (_, count) => count + 1, 0);
+
+program.hook('preAction', (_program, command) => {
+    if (!['encode', 'decode'].includes(command.name()) && !command.optsWithGlobals().path) {
+        command.error("error: required option '-p, --path <path>' not specified");
+    }
+});
 
 program.command('join').description('Join one matching open network and save membership on the adapter')
     .option('-c, --channel <channel>', 'Scan only this Zigbee channel', integer(11, 26))
@@ -349,6 +394,14 @@ packetOptions(program.command('write'))
 readOptions(program.command('read'))
     .description('Send one packet from stdin and print the matching reply')
     .action((_options, command) => readOnce(command.optsWithGlobals()));
+
+program.command('encode')
+    .description('Encode packets to send from JSON Lines to binary')
+    .action(() => convertPackets(encodePackets));
+
+program.command('decode')
+    .description('Decode received binary packets to JSON Lines')
+    .action(() => convertPackets(decodeJsonLines));
 
 program.command('reset').description('Leave the saved network and reset NVM3 tokens')
     .option('--yes', 'Confirm deletion of saved adapter state')

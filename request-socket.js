@@ -1,6 +1,6 @@
 import { once } from 'node:events';
 import { createServer } from 'node:net';
-import { encodePacket, readRecords } from "./packet-wire.js";
+import { encodePacketBytes, readPacketBytes } from "./packet-codec.js";
 
 const MAX_CLIENTS = 16;
 
@@ -25,12 +25,12 @@ async function serveClient(socket, handleRequest, signal) {
     socket.once('close', () => disconnected.abort());
     const requestSignal = AbortSignal.any([signal, disconnected.signal]);
 
-    for await (const body of readRecords(socket)) {
+    for await (const bytes of readPacketBytes(socket)) {
         requestSignal.throwIfAborted();
-        const result = await handleRequest(body, requestSignal);
+        const result = await handleRequest(bytes, requestSignal);
         requestSignal.throwIfAborted();
         await new Promise((resolve, reject) => {
-            socket.write(encodePacket(result), error => error ? reject(error) : resolve());
+            socket.write(encodePacketBytes(result), error => error ? reject(error) : resolve());
         });
     }
     socket.end();
