@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { addAbortListener, once } from 'node:events';
-import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Command, InvalidArgumentError, Option } from 'commander';
 import packageJson from './package.json' with { type: 'json' };
+import { decodeOutgoing, encodePacket, readRecords } from './packet-wire.js';
 import { openRequestSocket } from './request-socket.js';
 import { attachNetwork, capture, openRouter, resetRouter, sendPacket, SLStatus, Zcl } from './router.js';
 
@@ -37,14 +37,6 @@ function writeLog(level, message, namespace) {
     process.stderr.write(`${prefix}: ${text}\n`);
 }
 
-function parsePacket(line) {
-    const packet = JSON.parse(line);
-    if (packet === null || typeof packet !== 'object' || Array.isArray(packet)) {
-        throw new Error('Expected a packet object.');
-    }
-    return packet;
-}
-
 function createSender(ezsp, timeout, signal) {
     let tag = 0;
     let pending = Promise.resolve();
@@ -70,59 +62,50 @@ async function readWrites(send, signal) {
         return;
     }
 
-    const input = createInterface({ input: stdin, crlfDelay: Infinity, terminal: false });
-    const closeInput = () => input.close();
-    signal.addEventListener('abort', closeInput, { once: true });
-
-    let lineNumber = 0;
+    const abort = addAbortListener(signal, () => stdin.destroy());
+    let recordNumber = 0;
     try {
-        for await (const line of input) {
+        for await (const body of readRecords(stdin)) {
             if (signal.aborted) {
                 break;
             }
 
-            lineNumber++;
-            if (!line.trim()) {
-                continue;
-            }
-
+            recordNumber++;
             try {
-                await send(parsePacket(line));
+                await send(decodeOutgoing(body));
             } catch (error) {
                 if (signal.aborted) {
                     break;
                 }
                 process.exitCode = 1;
-                writeLog('error', `Write line ${lineNumber}: ${error.message}`);
+                writeLog('error', `Write record ${recordNumber}: ${error.message}`);
             }
         }
+    } catch (error) {
+        signal.throwIfAborted();
+        throw error;
     } finally {
-        signal.removeEventListener('abort', closeInput);
-        input.close();
+        abort[Symbol.dispose]();
         stdin.pause();
     }
 }
 
-async function readPacketLine() {
+async function readPacket() {
     const { stdin } = process;
-    const input = createInterface({ input: stdin, crlfDelay: Infinity, terminal: false });
     try {
-        for await (const line of input) {
-            if (line.trim()) {
-                return line;
-            }
+        for await (const body of readRecords(stdin)) {
+            return decodeOutgoing(body);
         }
         throw new Error('Expected a packet on stdin.');
     } finally {
-        input.close();
         stdin.pause();
     }
 }
 
 async function readOnce(options) {
-    const packet = parsePacket(await readPacketLine());
+    const packet = await readPacket();
     const reply = await run(options, 'read', packet);
-    process.stdout.write(`${JSON.stringify(reply)}\n`);
+    process.stdout.write(encodePacket(reply));
 }
 
 async function closeSession(session) {
@@ -189,9 +172,9 @@ async function run(options, mode, packet) {
                         if (!captureReady || sessionSignal.aborted) {
                             return;
                         }
-                        process.stdout.write(`${JSON.stringify(record)}\n`);
+                        process.stdout.write(encodePacket(record));
                         if (process.stdout.writableLength > 1024 * 1024) {
-                            stop.abort(new Error('JSON output consumer is too slow.'));
+                            stop.abort(new Error('Packet output consumer is too slow.'));
                         }
                     });
                 }
@@ -271,9 +254,9 @@ async function run(options, mode, packet) {
             return session.send(packet, expect, requestSignal);
         };
         if (options.socket !== undefined) {
-            const read = async (line, requestSignal) => {
+            const read = async (body, requestSignal) => {
                 try {
-                    return await send(parsePacket(line), expect, requestSignal);
+                    return await send(decodeOutgoing(body), expect, requestSignal);
                 } catch (error) {
                     if (!requestSignal.aborted) {
                         writeLog('error', `Socket request: ${error.message}`);

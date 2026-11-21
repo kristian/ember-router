@@ -1,8 +1,8 @@
 import { once } from 'node:events';
 import { createServer } from 'node:net';
+import { encodePacket, readRecords } from "./packet-wire.js";
 
 const MAX_CLIENTS = 16;
-const MAX_LINE_BYTES = 8192;
 
 function validateSocketPath(path) {
     if (process.platform === 'win32') {
@@ -20,43 +20,19 @@ function validateSocketPath(path) {
     }
 }
 
-function checkLineLength(line) {
-    if (Buffer.byteLength(line) > MAX_LINE_BYTES) {
-        throw new Error(`Request line exceeds ${MAX_LINE_BYTES} bytes.`);
-    }
-}
-
 async function serveClient(socket, handleRequest, signal) {
     const disconnected = new AbortController();
     socket.once('close', () => disconnected.abort());
     const requestSignal = AbortSignal.any([signal, disconnected.signal]);
 
-    const reply = async line => {
-        checkLineLength(line);
-        if (!line.trim()) {
-            return;
-        }
+    for await (const body of readRecords(socket)) {
         requestSignal.throwIfAborted();
-        const result = await handleRequest(line, requestSignal);
+        const result = await handleRequest(body, requestSignal);
         requestSignal.throwIfAborted();
         await new Promise((resolve, reject) => {
-            socket.write(`${JSON.stringify(result)}\n`, error => error ? reject(error) : resolve());
+            socket.write(encodePacket(result), error => error ? reject(error) : resolve());
         });
-    };
-
-    let buffer = '';
-    // Keep replies writable after a client half-closes.
-    for await (const chunk of socket.setEncoding('utf8').iterator({ destroyOnReturn: false })) {
-        buffer += chunk;
-        let newline;
-        while ((newline = buffer.indexOf('\n')) !== -1) {
-            const line = buffer.slice(0, newline);
-            buffer = buffer.slice(newline + 1);
-            await reply(line);
-        }
-        checkLineLength(buffer);
     }
-    await reply(buffer);
     socket.end();
 }
 

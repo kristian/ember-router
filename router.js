@@ -28,6 +28,7 @@ const {
 const { AdapterTransport } = requireEmber('zigbee-herdsman/dist/adapter/transport.js');
 const { DEFAULT_STACK_CONFIG } = requireEmber('zigbee-herdsman/dist/adapter/ember/adapter/emberAdapter.js');
 const { STACK_PROFILE_ZIGBEE_PRO } = requireEmber('zigbee-herdsman/dist/adapter/ember/consts.js');
+const { EZSP_EXTENDED_PARAMETERS_INDEX, EZSP_MAX_FRAME_LENGTH } = requireEmber('zigbee-herdsman/dist/adapter/ember/ezsp/consts.js');
 
 export { SLStatus, Zcl };
 
@@ -116,8 +117,17 @@ function pendingEvent(timeout, signal, subscribe, description = 'adapter callbac
     let unsubscribe;
     let timer;
     let abort;
+    const close = () => {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', abort);
+        unsubscribe?.();
+        unsubscribe = undefined;
+    };
     const promise = new Promise((resolve, reject) => {
-        abort = () => reject(signal.reason);
+        abort = () => {
+            close();
+            reject(signal.reason);
+        };
         signal.addEventListener('abort', abort, { once: true });
         try {
             signal.throwIfAborted();
@@ -128,14 +138,7 @@ function pendingEvent(timeout, signal, subscribe, description = 'adapter callbac
         }
     });
     promise.catch(() => {});
-    return {
-        promise,
-        close() {
-            clearTimeout(timer);
-            signal.removeEventListener('abort', abort);
-            unsubscribe?.();
-        },
-    };
+    return { promise, close };
 }
 
 async function networkCommand(ezsp, command, timeout, signal, expectedStatus = SLStatus.NETWORK_UP) {
@@ -302,7 +305,7 @@ function listenForInterview(ezsp, timeout, signal) {
                 destination: sender,
                 destinationEndpoint: frame.sourceEndpoint,
                 clusterId: frame.clusterId,
-                payload: answer.payload.toString('hex'),
+                payload: answer.payload,
             }, tag, timeout, signal);
             if (answer.complete) {
                 complete.resolve();
@@ -432,14 +435,14 @@ function apsPacket(frame, source, lqi, payload) {
         profileId: frame.profileId,
         clusterId: frame.clusterId,
         lqi,
-        payload: payload.toString('hex'),
+        payload,
     };
 }
 
 export function capture(ezsp, emit) {
     observeAps(ezsp, (_type, frame, lqi, source, payload) => emit(apsPacket(frame, source, lqi, payload)));
     ezsp.on('touchlinkMessage', (panId, source, groupId, lqi, payload) =>
-        emit({ type: 'touchlink', panId, source, groupId, lqi, payload: payload.toString('hex') }));
+        emit({ type: 'touchlink', panId, source, groupId, lqi, payload }));
 }
 
 const attributeReplies = new Map([
@@ -478,12 +481,14 @@ export async function sendPacket(ezsp, packet, tag, timeout, signal, expect) {
             throw routerError(`Invalid ${label}.`, 'INVALID_PACKET');
         }
     }
-    if (typeof payload !== 'string' || !/^(?:[\da-f]{2})+$/i.test(payload)) {
-        throw routerError('payload must be nonempty, even-length hex.', 'INVALID_PACKET');
+    // SEND_UNICAST uses three bytes for mode and destination, eleven for the APS frame, and one for payload length.
+    const messageTagLength = ezsp.version < 0x0e ? 1 : 2;
+    const maxPayloadLength = EZSP_MAX_FRAME_LENGTH - EZSP_EXTENDED_PARAMETERS_INDEX - 3 - 11 - messageTagLength - 1;
+    if (!Buffer.isBuffer(payload) || payload.length === 0 || payload.length > maxPayloadLength) {
+        throw routerError(`payload must contain 1 to ${maxPayloadLength} bytes.`, 'INVALID_PACKET');
     }
 
-    const message = Buffer.from(payload, 'hex');
-    const request = expect && Zcl.Header.fromBuffer(message);
+    const request = expect && Zcl.Header.fromBuffer(payload);
     if (expect && (!request || !(request.isGlobal || request.isSpecific) || request.frameControl.reservedBits !== 0)) {
         throw routerError('payload must have a valid ZCL header to match a reply.', 'INVALID_PACKET');
     }
@@ -521,7 +526,7 @@ export async function sendPacket(ezsp, packet, tag, timeout, signal, expect) {
         }), 'ZCL reply', 'REPLY_TIMEOUT');
     try {
         signal.throwIfAborted();
-        const [status] = await ezsp.ezspSendUnicast(EmberOutgoingMessageType.DIRECT, destination, aps, tag, message);
+        const [status] = await ezsp.ezspSendUnicast(EmberOutgoingMessageType.DIRECT, destination, aps, tag, payload);
         check(status, 'Queue write', 'QUEUE_FAILED');
         const delivered = delivery.promise.then(result => check(result, 'Deliver write', 'DELIVERY_FAILED'));
         if (!reply) {
