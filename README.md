@@ -119,20 +119,23 @@ ember-router decode < capture.bin
 
 ### Node.js socket client
 
-`encodePacket(packet)` converts a packet to send into bytes. `decodePacket(bytes)` converts one received packet to a JSON-shaped object. Use `decodePackets(socket)` to decode received packets from a stream.
+Connect to a running `ember-router run --socket` instance from Node.js:
 
 ```js
-import { createConnection } from 'node:net';
-import { decodePackets, encodePacket } from 'ember-router';
+import { createRouterClient } from 'ember-router/client';
 
-const socket = createConnection('/path/to/private/ember-router.sock');
-socket.write(encodePacket({ destination: 4660, clusterId: 513, payload: '1001001200' }));
-for await (const reply of decodePackets(socket)) {
+const router = createRouterClient('/path/to/private/ember-router.sock', { timeout: 30_000 });
+try {
+    const reply = await router.request({ destination: 4660, clusterId: 513, payload: '1001001200' });
     console.log(reply);
-    socket.end();
-    break;
+} finally {
+    router.close();
 }
 ```
+
+Requests share a connection and run one at a time. The timeout is in milliseconds and defaults to 30 seconds per exchange, starting when the request reaches the front of the queue. A router failure, timeout, or disconnect rejects the request. After a lost connection, the next request reconnects. A Zigbee error response is returned as a packet, so inspect its ZCL status when needed.
+
+The package root exports the packet helpers. `encodePacket(packet)` produces request bytes, `decodePacket(bytes)` decodes one received packet, and `decodePackets(stream)` decodes a stream of packets.
 
 ### Read an attribute
 
