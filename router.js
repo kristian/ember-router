@@ -1,6 +1,6 @@
 import './silence-ember-zli.js';
 import { createRequire } from 'node:module';
-import { createInterview } from './interview.js';
+import { basicReadResponse, createInterview } from './interview.js';
 import { validateSendPacket } from './packet-codec.js';
 import {
     emberNetworkConfig,
@@ -444,6 +444,40 @@ export function capture(ezsp, emit) {
     observeAps(ezsp, (_type, frame, lqi, source, payload) => emit(apsPacket(frame, source, lqi, payload)));
     ezsp.on('touchlinkMessage', (panId, source, groupId, lqi, payload) =>
         emit({ type: 'touchlink', panId, source: BigInt(source), groupId, lqi, payload }));
+}
+
+export function respondToBasicReads(ezsp, timeout, signal, log) {
+    let pending = Promise.resolve();
+    let queued = 0;
+    // Keep delivery callbacks distinct from the stdin and socket sender's low tags.
+    let tag = 0x7f;
+    const clusterId = Zcl.Clusters.genBasic.ID;
+
+    signal.throwIfAborted();
+    const unsubscribe = observeAps(ezsp, (type, frame, _lqi, sender, payload) => {
+        if (signal.aborted || type !== EmberIncomingMessageType.UNICAST || sender !== ZSpec.COORDINATOR_ADDRESS ||
+            frame.profileId !== ZSpec.HA_PROFILE_ID || frame.clusterId !== clusterId ||
+            frame.sourceEndpoint !== 1 || frame.destinationEndpoint !== 1 || queued >= 8) {
+            return;
+        }
+
+        const response = basicReadResponse(payload);
+        if (!response) {
+            return;
+        }
+
+        queued++;
+        pending = pending.then(() => {
+            signal.throwIfAborted();
+            tag = 0x80 | ((tag + 1) & 0x7f);
+            return sendPacket(ezsp, { destination: sender, clusterId, payload: response }, tag, timeout, signal);
+        }).catch(error => {
+            if (!signal.aborted) {
+                log('warning', `Basic Read Attributes response: ${error.message}`);
+            }
+        }).finally(() => { queued--; });
+    });
+    signal.addEventListener('abort', unsubscribe, { once: true });
 }
 
 const attributeReplies = new Map([

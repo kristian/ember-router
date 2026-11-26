@@ -37,6 +37,7 @@ ember-router decode
 - `--timeout <ms>` for scan and network callbacks (default `45000`).
 - `--read-timeout <ms>` for `read` and `run --socket` to set the ZCL reply timeout (default `5000`, range `100`–`300000`).
 - `--write-timeout <ms>` for `run`, `write`, and `read` to set the APS delivery timeout (default `15000`).
+- `--respond-basic-reads` for `run`, `write`, and `read` to answer standard Basic Read Attributes requests from coordinator endpoint 1 while the router session is open. Replies use the same Basic attributes as `join --answer-interview`.
 - `--expect <commandId>` for `read` and `run --socket` to select the ZCL reply command by decimal or `0x` value.
 - `--socket <path>` for `run` to accept requests over a local Unix domain socket or a Windows named pipe.
 - `-g, --graceful` for `run` and `write` to attempt one reconnect after adapter loss. Repeat as `-gg` to keep retrying.

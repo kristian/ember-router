@@ -8,7 +8,7 @@ import packageJson from './package.json' with { type: 'json' };
 import { decodePackets, encodePacket } from './packet.js';
 import { decodeSendPacket, encodePacketBytes, readPacketBytes } from './packet-codec.js';
 import { openRequestSocket } from './request-socket.js';
-import { attachNetwork, capture, openRouter, resetRouter, sendPacket, SLStatus, Zcl } from './router.js';
+import { attachNetwork, capture, openRouter, resetRouter, respondToBasicReads, sendPacket, SLStatus, Zcl } from './router.js';
 
 function integer(min, max) {
     return value => {
@@ -227,6 +227,9 @@ async function run(options, mode, packet) {
                     }
                     networkId = id;
                 }
+                if (!join && options.respondBasicReads) {
+                    respondToBasicReads(ezsp, options.writeTimeout, sessionSignal, log);
+                }
                 captureReady = true;
                 writeLog('info', `${join ? 'Joined' : 'Resumed'} PAN 0x${network.panId.toString(16)} on channel ${network.radioChannel}.`);
             }
@@ -362,6 +365,7 @@ program.command('join').description('Join one matching open network and save mem
 
 function packetOptions(command) {
     return command
+        .option('--respond-basic-reads', 'Answer Basic Read Attributes requests from coordinator endpoint 1')
         .option('--write-timeout <ms>', 'Wait for each APS delivery status', integer(100, 300_000), 15000);
 }
 

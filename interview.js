@@ -15,11 +15,37 @@ function string(value) {
 const basicAttributes = new Map([
     [0x0000, Buffer.from([0x20, 8])], // ZCLVersion: ZCL revision 8.
     [0x0001, Buffer.from([0x20, 1])], // ApplicationVersion: version 1.
+    [0x0003, Buffer.from([0x20, 0])], // HWVersion: unspecified.
     [0x0004, string('Generic')], // ManufacturerName: generic manufacturer label.
     [0x0005, string('Zigbee Router')], // ModelIdentifier: generic router name.
     [0x0007, Buffer.from([0x30, 4])], // PowerSource: DC source.
     [0xfffd, Buffer.from([0x21, 2, 0])], // ClusterRevision: Basic cluster revision 2.
 ]);
+
+function readAttributeRecords(attributes, body) {
+    if (body.length === 0 || body.length % 2 !== 0 || body.length > 48) {
+        return;
+    }
+
+    const records = [];
+    for (let offset = 0; offset < body.length; offset += 2) {
+        const id = body.readUInt16LE(offset);
+        const value = attributes.get(id);
+        records.push(Buffer.concat([word(id), Buffer.from([value ? 0 : 0x86]), value ?? Buffer.alloc(0)]));
+    }
+    return Buffer.concat(records);
+}
+
+export function basicReadResponse(payload) {
+    // Standard global client-to-server Read Attributes, with either default response setting.
+    if ((payload[0] !== 0 && payload[0] !== 0x10) || payload[2] !== 0) {
+        return;
+    }
+    const records = readAttributeRecords(basicAttributes, payload.subarray(3));
+    if (records) {
+        return Buffer.concat([Buffer.from([0x18, payload[1], 1]), records]);
+    }
+}
 
 export function createInterview() {
     let identifyUntil = 0;
@@ -74,14 +100,11 @@ export function createInterview() {
             return response(0x0d, Buffer.concat([Buffer.from([Number(page.length === remaining.length)]), ...records]));
         }
 
-        if (frameType === 0 && command === 0 && body.length > 0 && body.length % 2 === 0 && body.length <= 48) {
-            const records = [];
-            for (let offset = 0; offset < body.length; offset += 2) {
-                const id = body.readUInt16LE(offset);
-                const value = attributes.get(id);
-                records.push(Buffer.concat([word(id), Buffer.from([value ? 0 : 0x86]), value ?? Buffer.alloc(0)]));
+        if (frameType === 0 && command === 0) {
+            const records = readAttributeRecords(attributes, body);
+            if (records) {
+                return response(1, records);
             }
-            return response(1, Buffer.concat(records));
         }
 
         if (frameType === 0 && command === 6 && !manufacturerSpecific && !serverToClient && cluster === BASIC &&
