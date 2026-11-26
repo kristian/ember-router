@@ -124,7 +124,7 @@ Connect to a running `ember-router run --socket` instance from Node.js:
 ```js
 import { createRouterClient } from 'ember-router/client';
 
-const router = createRouterClient('/path/to/private/ember-router.sock', { timeout: 30_000 });
+const router = createRouterClient('/path/to/private/ember-router.sock', { timeout: 30_000, retry: true });
 try {
     const reply = await router.request({ destination: 4660, clusterId: 513, payload: '1001001200' });
     console.log(reply);
@@ -133,7 +133,11 @@ try {
 }
 ```
 
-Requests share a connection and run one at a time. The timeout is in milliseconds and defaults to 30 seconds per exchange, starting when the request reaches the front of the queue. A router failure, timeout, or disconnect rejects the request. After a lost connection, the next request reconnects. A Zigbee error response is returned as a packet, so inspect its ZCL status when needed.
+Requests share a connection and run one at a time. The timeout is in milliseconds and defaults to 30 seconds per attempt, starting when the attempt begins. After a lost connection, the next attempt reconnects. A Zigbee error response is returned as a packet, so inspect its ZCL status when needed.
+
+`retry: true` resends the same encoded packet once after an empty router reply, a timeout, or a recoverable socket error. It preserves the original ZCL transaction sequence number. Both attempts run before the next queued request. Retries are off by default.
+
+A retry can recover a request that was lost in transit. A missing reply can also occur after the device has applied the command. In that case, the device may ignore the retry as a duplicate or process it again. Enable retries only for commands that are safe to replay.
 
 The package root exports the packet helpers. `encodePacket(packet)` produces request bytes, `decodePacket(bytes)` decodes one received packet, and `decodePackets(stream)` decodes a stream of packets.
 

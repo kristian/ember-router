@@ -1,15 +1,19 @@
 {
   "name": "ember-router",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "ZigBee router CLI for EmberZNet-based adapters using ember-zli and zigbee-herdsman",
   "type": "module",
   "bin": "./index.js",
+  "scripts": {
+    "test": "node --test"
+  },
   "exports": {
     ".": "./packet.js",
     "./client": "./router-client.js"
   },
   "files": [
     "*.js",
+    "!test/**",
     "!.yarn/**"
   ],
   "engines": {

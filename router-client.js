@@ -1,12 +1,24 @@
 import { createConnection } from "node:net";
 import { decodePackets, encodePacket } from "./packet.js";
 
-export function createRouterClient(path, { timeout = 30_000 } = {}) {
+const retryableErrors = new Set([
+    "ROUTER_REQUEST_FAILED", "ROUTER_REPLY_TIMEOUT", "ROUTER_DISCONNECTED",
+    "ECONNREFUSED", "ECONNRESET", "ENOENT", "EPIPE", "ETIMEDOUT",
+]);
+
+function routerError(message, code) {
+    return Object.assign(new Error(message), { code });
+}
+
+export function createRouterClient(path, { timeout = 30_000, retry = false } = {}) {
     if (typeof path !== "string" || !path || path.includes("\0")) {
         throw new TypeError("Expected a local socket or named pipe path.");
     }
     if (!Number.isInteger(timeout) || timeout < 0) {
         throw new RangeError("timeout must be a positive integer.");
+    }
+    if (typeof retry !== "boolean") {
+        throw new TypeError("retry must be a boolean.");
     }
 
     let connection;
@@ -25,12 +37,14 @@ export function createRouterClient(path, { timeout = 30_000 } = {}) {
         }
 
         const { socket, replies } = connection;
-        const deadline = setTimeout(() => socket.destroy(new Error("Timed out waiting for the router reply.")), timeout);
+        const deadline = setTimeout(() => {
+            socket.destroy(routerError("Timed out waiting for the router reply.", "ROUTER_REPLY_TIMEOUT"));
+        }, timeout);
         try {
             socket.write(bytes);
             const { done, value } = await replies.next();
             if (done) {
-                throw new Error("Router disconnected before replying.");
+                throw routerError("Router disconnected before replying.", "ROUTER_DISCONNECTED");
             }
             return value;
         } catch (error) {
@@ -41,17 +55,26 @@ export function createRouterClient(path, { timeout = 30_000 } = {}) {
         }
     }
 
+    async function send(bytes) {
+        const reply = await exchange(bytes);
+        if (reply === null) {
+            throw routerError("Router could not complete the Zigbee request.", "ROUTER_REQUEST_FAILED");
+        }
+        return reply;
+    }
+
     return {
         async request(packet) {
             const bytes = encodePacket(packet);
-            // the socket protocol matches replies to requests by order
-            const result = pending.then(() => exchange(bytes));
+            // keep the same encoded request and its retry ahead of later requests.
+            const result = pending.then(() => send(bytes)).catch(error => {
+                if (!retry || closed || !retryableErrors.has(error.code)) {
+                    throw error;
+                }
+                return send(bytes);
+            });
             pending = result.catch(() => {});
-            const reply = await result;
-            if (reply === null) {
-                throw new Error("Router could not complete the Zigbee request.");
-            }
-            return reply;
+            return result;
         },
         close() {
             closed = true;
