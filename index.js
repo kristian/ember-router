@@ -282,6 +282,9 @@ async function run(options, mode, packet) {
 
         const expect = { commandId: options.expect, timeout: options.readTimeout };
         if (mode === 'read') {
+            if (options.settleDelay > 0) {
+                await delay(options.settleDelay, undefined, { signal: session.signal });
+            }
             return await sendPacket(session.ezsp, packet, 1, options.writeTimeout, session.signal, expect);
         }
 
@@ -393,6 +396,7 @@ packetOptions(program.command('write'))
 
 readOptions(program.command('read'))
     .description('Send one packet from stdin and print the matching reply')
+    .option('--settle-delay <ms>', 'Wait after resuming the network before sending', integer(0, 300_000), 0)
     .action((_options, command) => readOnce(command.optsWithGlobals()));
 
 program.command('encode')

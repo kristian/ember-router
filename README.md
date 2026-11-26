@@ -159,6 +159,8 @@ printf '%s' 0f00003412040101020101001001001200 | xxd -r -p |
 
 The request body is 15 bytes and ends with ZCL payload `10 01 00 12 00`. The router infers Read Attributes Response (`0x01`) or Write Attributes Response (`0x04`) for those requests. Use `--expect` to select a different ZCL reply command. `read` writes one matching packet, including a matching ZCL Default Response with an error status. A send failure or timeout reports an error on stderr and exits with status `1`.
 
+For a shared capture and router adapter, `read --settle-delay 5000` waits five seconds after the network resumes before sending. The delay is in milliseconds and defaults to zero. The delivery and reply timeouts start when the request is sent.
+
 ### Local socket
 
 ```sh
