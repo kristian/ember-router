@@ -8,7 +8,7 @@ import packageJson from './package.json' with { type: 'json' };
 import { decodePackets, encodePacket } from './packet.js';
 import { decodeSendPacket, encodePacketBytes, readPacketBytes } from './packet-codec.js';
 import { openRequestSocket } from './request-socket.js';
-import { attachNetwork, capture, openRouter, resetRouter, respondToBasicReads, sendPacket, SLStatus, Zcl } from './router.js';
+import { attachNetwork, capture, openRouter, resetRouter, answerCoordinatorRequests, sendPacket, SLStatus, Zcl } from './router.js';
 
 function integer(min, max) {
     return value => {
@@ -218,6 +218,16 @@ async function run(options, mode, packet) {
                     });
                 }
 
+                const startAnswering = () => answerCoordinatorRequests(ezsp, {
+                    manufacturerCode: options.manufacturerCode,
+                    timeout: options.writeTimeout,
+                    signal: sessionSignal,
+                    log,
+                });
+                const verifyBeforeAnswering = networkId !== undefined;
+                if (options.answerCoordinatorRequests && !verifyBeforeAnswering) {
+                    startAnswering();
+                }
                 const network = await attachNetwork(ezsp, options, join, sessionSignal);
                 sessionSignal.throwIfAborted();
                 if (options.graceful) {
@@ -227,8 +237,8 @@ async function run(options, mode, packet) {
                     }
                     networkId = id;
                 }
-                if (!join && options.respondBasicReads) {
-                    respondToBasicReads(ezsp, options.writeTimeout, sessionSignal, log);
+                if (options.answerCoordinatorRequests && verifyBeforeAnswering) {
+                    startAnswering();
                 }
                 captureReady = true;
                 writeLog('info', `${join ? 'Joined' : 'Resumed'} PAN 0x${network.panId.toString(16)} on channel ${network.radioChannel}.`);
@@ -239,6 +249,7 @@ async function run(options, mode, packet) {
                 send: streaming ? createSender(ezsp, options.writeTimeout, sessionSignal) : undefined,
             };
         } catch (error) {
+            disconnected.abort(error);
             await closeSession(adapter);
             throw error;
         }
@@ -312,6 +323,12 @@ async function run(options, mode, packet) {
             closeSocket = await openRequestSocket(options.socket, read, signal, error => stop.abort(error));
         }
         await readWrites(send, signal);
+        if (options.listenAfterWrite > 0 && !signal.aborted) {
+            await delay(options.listenAfterWrite, undefined, { signal }).catch(error => {
+                signal.throwIfAborted();
+                throw error;
+            });
+        }
         if (!options.exitAfterWrite && !signal.aborted) {
             await once(signal, 'abort');
         }
@@ -365,7 +382,7 @@ program.command('join').description('Join one matching open network and save mem
 
 function packetOptions(command) {
     return command
-        .option('--respond-basic-reads', 'Answer Basic Read Attributes requests from coordinator endpoint 1')
+        .option('--answer-coordinator-requests', 'Answer supported coordinator requests while connected')
         .option('--write-timeout <ms>', 'Wait for each APS delivery status', integer(100, 300_000), 15000);
 }
 
@@ -392,7 +409,11 @@ readOptions(program.command('run', { isDefault: true }))
 
 packetOptions(program.command('write'))
     .addOption(gracefulOption())
-    .description('Resume and send packets from stdin, then exit at EOF')
+    .addOption(new Option('--listen-after-write <ms>', 'Keep listening after the final write and EOF')
+        .argParser(integer(0, 300_000))
+        .env('EMBER_ROUTER_LISTEN_AFTER_WRITE_MS')
+        .default(0))
+    .description('Resume, send packets from stdin, and exit after EOF')
     .action((_options, command) => {
         const options = command.optsWithGlobals();
         return run({ ...options, exitAfterWrite: true }, 'write');

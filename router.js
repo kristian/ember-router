@@ -1,6 +1,6 @@
 import './silence-ember-zli.js';
 import { createRequire } from 'node:module';
-import { basicReadResponse, createInterview } from './interview.js';
+import { createCoordinatorResponder } from './coordinator-requests.js';
 import { validateSendPacket } from './packet-codec.js';
 import {
     emberNetworkConfig,
@@ -9,6 +9,7 @@ import {
     emberStart,
     emberStop,
 } from 'ember-zli/dist/utils/ember.js';
+import { ROUTER_FIXED_ENDPOINTS } from 'ember-zli/dist/utils/router-endpoints.js';
 
 const requireHere = createRequire(import.meta.url);
 const requireEmber = createRequire(requireHere.resolve('ember-zli'));
@@ -33,6 +34,10 @@ const { EZSP_EXTENDED_PARAMETERS_INDEX, EZSP_MAX_FRAME_LENGTH } = requireEmber('
 
 export { SLStatus, Zcl };
 
+const basicClusterId = Zcl.Clusters.genBasic.ID;
+const identifyClusterId = Zcl.Clusters.genIdentify.ID;
+const routerEndpoint = ROUTER_FIXED_ENDPOINTS.find(endpoint => endpoint.profileId === ZSpec.HA_PROFILE_ID);
+
 function routerError(message, code) {
     return Object.assign(new Error(message), code ? { code } : {});
 }
@@ -41,6 +46,23 @@ function check(status, operation, code) {
     if (status !== SLStatus.OK) {
         throw routerError(`${operation}: ${SLStatus[status] ?? status}`, code);
     }
+}
+
+export async function registerRouterEndpoints(ezsp, answerRequests) {
+    if (answerRequests) {
+        const { endpoint, profileId, deviceId, deviceVersion, inClusterList, outClusterList } = routerEndpoint;
+        const [status] = await ezsp.ezspGetEndpointFlags(endpoint);
+        if (status !== SLStatus.OK) {
+            // The NCP's binding policy validates the endpoint's output clusters.
+            check(await ezsp.ezspAddEndpoint(
+                endpoint, profileId, deviceId, deviceVersion,
+                [...new Set([...inClusterList, identifyClusterId])],
+                [...new Set([...outClusterList, basicClusterId, identifyClusterId, Zcl.Clusters.hvacThermostat.ID])],
+            ), 'Register router application endpoint');
+        }
+    }
+    // The helper skips an already registered endpoint and still registers its multicast groups.
+    await emberRegisterFixedEndpoints(ezsp, [], true);
 }
 
 export async function openRouter(options, log, onDisconnect, signal) {
@@ -100,7 +122,7 @@ export async function openRouter(options, log, onDisconnect, signal) {
         signal?.throwIfAborted();
         ezsp.once('ncpNeedsResetAndInit', onReset);
         await emberNetworkConfig(ezsp, DEFAULT_STACK_CONFIG, options.manufacturerCode);
-        await emberRegisterFixedEndpoints(ezsp, [], true);
+        await registerRouterEndpoints(ezsp, options.answerCoordinatorRequests || options.answerInterview);
         signal?.throwIfAborted();
         if (disconnected || !transport.isOpen) {
             throw disconnected ?? routerError('Adapter connection closed during initialization.', 'ADAPTER_DISCONNECTED');
@@ -282,41 +304,6 @@ async function updateTrustCenterKey(ezsp, timeout, signal) {
     }
 }
 
-function listenForInterview(ezsp, timeout, signal) {
-    const reply = createInterview();
-    const complete = Promise.withResolvers();
-    complete.promise.catch(() => {});
-    let queue = Promise.resolve();
-    let tag = 0;
-
-    const listener = (type, frame, _lqi, sender, payload) => {
-        if (type > 1 || sender !== ZSpec.COORDINATOR_ADDRESS ||
-            frame.profileId !== ZSpec.HA_PROFILE_ID || frame.destinationEndpoint !== 1) {
-            return;
-        }
-        queue = queue.then(async () => {
-            signal.throwIfAborted();
-            const answer = reply(frame.clusterId, payload);
-            if (!answer) {
-                return;
-            }
-
-            tag = (tag + 1) & 0x7f;
-            await sendPacket(ezsp, {
-                destination: sender,
-                destinationEndpoint: frame.sourceEndpoint,
-                clusterId: frame.clusterId,
-                payload: answer.payload,
-            }, tag, timeout, signal);
-            if (answer.complete) {
-                complete.resolve();
-            }
-        }).catch(complete.reject);
-    };
-    ezsp.on('incomingMessage', listener);
-    return { complete: complete.promise, close: () => ezsp.off('incomingMessage', listener) };
-}
-
 export async function attachNetwork(ezsp, options, join, signal) {
     const status = await networkCommand(ezsp, () => emberNetworkInit(ezsp, true), options.timeout, signal);
     if (status !== SLStatus.NOT_JOINED) {
@@ -330,7 +317,11 @@ export async function attachNetwork(ezsp, options, join, signal) {
 
     const stop = new AbortController();
     const joinSignal = AbortSignal.any([signal, stop.signal]);
-    const interview = join && options.answerInterview ? listenForInterview(ezsp, options.timeout, joinSignal) : undefined;
+    const interview = join && options.answerInterview ? answerCoordinatorRequests(ezsp, {
+        manufacturerCode: options.manufacturerCode,
+        timeout: options.timeout,
+        signal: joinSignal,
+    }) : undefined;
     try {
         const selected = join ? await joinNetwork(ezsp, options, joinSignal) : undefined;
         const network = await verifyNetwork(ezsp, selected);
@@ -340,7 +331,7 @@ export async function attachNetwork(ezsp, options, join, signal) {
 
         if (join) {
             const interviewDone = interview && pendingEvent(options.timeout, joinSignal, (resolve, reject) => {
-                interview.complete.then(resolve, reject);
+                interview.then(resolve, reject);
             }, 'the interview reporting response');
             try {
                 const keyUpdate = options.skipPostJoinSecurity
@@ -353,7 +344,6 @@ export async function attachNetwork(ezsp, options, join, signal) {
         }
         return network;
     } finally {
-        interview?.close();
         stop.abort();
     }
 }
@@ -446,38 +436,53 @@ export function capture(ezsp, emit) {
         emit({ type: 'touchlink', panId, source: BigInt(source), groupId, lqi, payload }));
 }
 
-export function respondToBasicReads(ezsp, timeout, signal, log) {
+export function answerCoordinatorRequests(ezsp, { manufacturerCode, timeout, signal, log }) {
+    const reply = createCoordinatorResponder(manufacturerCode);
+    const configured = Promise.withResolvers();
+    configured.promise.catch(() => {});
     let pending = Promise.resolve();
     let queued = 0;
     // Keep delivery callbacks distinct from the stdin and socket sender's low tags.
     let tag = 0x7f;
-    const clusterId = Zcl.Clusters.genBasic.ID;
 
     signal.throwIfAborted();
     const unsubscribe = observeAps(ezsp, (type, frame, _lqi, sender, payload) => {
-        if (signal.aborted || type !== EmberIncomingMessageType.UNICAST || sender !== ZSpec.COORDINATOR_ADDRESS ||
-            frame.profileId !== ZSpec.HA_PROFILE_ID || frame.clusterId !== clusterId ||
-            frame.sourceEndpoint !== 1 || frame.destinationEndpoint !== 1 || queued >= 8) {
+        const directed = type === EmberIncomingMessageType.UNICAST || type === EmberIncomingMessageType.UNICAST_REPLY;
+        if (signal.aborted || !directed || sender !== ZSpec.COORDINATOR_ADDRESS ||
+            frame.profileId !== routerEndpoint.profileId || frame.destinationEndpoint !== routerEndpoint.endpoint ||
+            frame.sourceEndpoint < 1 || frame.sourceEndpoint > 240 || queued >= 8) {
             return;
         }
 
-        const response = basicReadResponse(payload);
-        if (!response) {
+        const { clusterId, sourceEndpoint } = frame;
+        const answer = reply(clusterId, payload);
+        if (!answer) {
             return;
         }
 
         queued++;
-        pending = pending.then(() => {
+        pending = pending.then(async () => {
             signal.throwIfAborted();
             tag = 0x80 | ((tag + 1) & 0x7f);
-            return sendPacket(ezsp, { destination: sender, clusterId, payload: response }, tag, timeout, signal);
+            await sendPacket(ezsp, {
+                destination: sender,
+                sourceEndpoint: routerEndpoint.endpoint,
+                destinationEndpoint: sourceEndpoint,
+                clusterId,
+                payload: answer.payload,
+            }, tag, timeout, signal);
+            if (answer.reportingConfigured) {
+                configured.resolve();
+            }
         }).catch(error => {
+            configured.reject(error);
             if (!signal.aborted) {
-                log('warning', `Basic Read Attributes response: ${error.message}`);
+                log?.('warning', `Coordinator response on cluster 0x${clusterId.toString(16)}: ${error.message}`);
             }
         }).finally(() => { queued--; });
     });
     signal.addEventListener('abort', unsubscribe, { once: true });
+    return configured.promise;
 }
 
 const attributeReplies = new Map([

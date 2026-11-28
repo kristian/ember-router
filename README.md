@@ -26,7 +26,9 @@ ember-router decode
 
 `read` sends one packet from stdin and writes the matching ZCL reply to stdout.
 
-`write` resumes the saved network and sends a single packet or a batch from stdin. It exits after stdin closes and all submitted packets have been processed.
+`write` resumes the saved network and sends a single packet or a batch from stdin. It exits after stdin closes and all submitted packets have been processed. Use `--listen-after-write` to keep it open for follow-up requests.
+
+When upgrading from 2.4.0, replace `--respond-basic-reads` in existing commands and scripts with `--answer-coordinator-requests`.
 
 ### Options
 
@@ -37,7 +39,8 @@ ember-router decode
 - `--timeout <ms>` for scan and network callbacks (default `45000`).
 - `--read-timeout <ms>` for `read` and `run --socket` to set the ZCL reply timeout (default `5000`, range `100`–`300000`).
 - `--write-timeout <ms>` for `run`, `write`, and `read` to set the APS delivery timeout (default `15000`).
-- `--respond-basic-reads` for `run`, `write`, and `read` to answer standard Basic Read Attributes requests from coordinator endpoint 1 while the router session is open. Replies use the same Basic attributes as `join --answer-interview`.
+- `--answer-coordinator-requests` for `run`, `write`, and `read` to answer coordinator requests on endpoint 1 while the session is open. Supported requests include Basic attribute reads, Power Source Configure Reporting, Identify, and Thermostat client Cluster Revision reads. Power Source configuration accepts change-only reporting, disabled reporting, and the `0xfffe` interval for coordinator compatibility. Applications can send their own periodic reports. Reads of manufacturer-specific Identify attribute `0x4000` return an inactive value with the request’s manufacturer code. Other manufacturer-specific requests must match `-m`.
+- `--listen-after-write <ms>` for `write` keeps the session open after stdin closes and writes finish (default `0`, range `0`–`300000`). It can also be set with `EMBER_ROUTER_LISTEN_AFTER_WRITE_MS`.
 - `--expect <commandId>` for `read` and `run --socket` to select the ZCL reply command by decimal or `0x` value.
 - `--socket <path>` for `run` to accept requests over a local Unix domain socket or a Windows named pipe.
 - `-g, --graceful` for `run` and `write` to attempt one reconnect after adapter loss. Repeat as `-gg` to keep retrying.
@@ -59,7 +62,7 @@ Stdin, stdout, stderr, and local socket clients stay open during recovery. Inter
 - `-l, --link-key <hex>` to use a derived 16-byte link key as 32 hex digits (default uses the global Zigbee link key). You can also set `EMBER_ROUTER_LINK_KEY`.
 - `-P, --radio-power <dbm>` to set transmit power in dBm (default `5`).
 - `--scan-duration <exponent>` to set the EZSP active scan duration exponent from 0 to 14 (default `4`).
-- `--answer-interview` to answer coordinator interview requests and wait for delivery of the Basic Power Source Configure Reporting response.
+- `--answer-interview` to answer coordinator requests while joining and wait for delivery of the Basic Power Source Configure Reporting response. It handles the same requests as `--answer-coordinator-requests`.
 - `--skip-post-join-security` to skip closing local permit-join and requesting and verifying the trust-center link-key update.
 
 
