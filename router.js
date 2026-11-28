@@ -1,7 +1,7 @@
 import './silence-ember-zli.js';
 import { createRequire } from 'node:module';
 import { createCoordinatorResponder } from './coordinator-requests.js';
-import { validateSendPacket } from './packet-codec.js';
+import { validateSendPacket } from './packet-io.js';
 import {
     emberNetworkConfig,
     emberNetworkInit,

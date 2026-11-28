@@ -5,7 +5,8 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { encodePacket, readPacketBytes } from "../packet-codec.js";
+import { encodePacket } from "ember-router";
+import { readPacketBytes } from "../packet-io.js";
 import { createRouterClient } from "../router-client.js";
 
 const write = { destination: 4660, clusterId: 513, payload: "042112010203401001" };

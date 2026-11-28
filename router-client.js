@@ -1,5 +1,5 @@
 import { createConnection } from "node:net";
-import { decodePackets, encodePacket } from "./packet.js";
+import { decodePackets, encodePacket } from "./packet-codec.js";
 
 const retryableErrors = new Set([
     "ROUTER_REQUEST_FAILED", "ROUTER_REPLY_TIMEOUT", "ROUTER_DISCONNECTED",

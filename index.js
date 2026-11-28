@@ -5,8 +5,8 @@ import { pipeline } from 'node:stream/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Command, InvalidArgumentError, Option } from 'commander';
 import packageJson from './package.json' with { type: 'json' };
-import { decodePackets, encodePacket } from './packet.js';
-import { decodeSendPacket, encodePacketBytes, readPacketBytes } from './packet-codec.js';
+import { decodePackets, encodePacket } from './packet-codec.js';
+import { decodeSendPacket, encodePacketBytes, readPacketBytes } from './packet-io.js';
 import { openRequestSocket } from './request-socket.js';
 import { attachNetwork, capture, openRouter, resetRouter, answerCoordinatorRequests, sendPacket, SLStatus, Zcl } from './router.js';
 

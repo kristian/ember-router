@@ -1,6 +1,6 @@
 import { once } from 'node:events';
 import { createServer } from 'node:net';
-import { encodePacketBytes, readPacketBytes } from "./packet-codec.js";
+import { encodePacketBytes, readPacketBytes } from "./packet-io.js";
 
 const MAX_CLIENTS = 16;
 
